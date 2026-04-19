@@ -1,46 +1,74 @@
 package ru.test
 
-import java.time.LocalDateTime
+import java.time.{LocalDate, LocalDateTime}
 
 sealed trait Event {
-  def sourceFile: String
+  def timestamp: LocalDateTime
 }
 
+sealed trait SearchEvent extends Event {
+  def searchId: String
+  def resultDocs: Set[String]
+}
+
+final case class SearchParameter(
+  parameterId: String,
+  value: String
+)
+
 final case class SessionStartEvent(
-                                    timestamp: LocalDateTime,
-                                    sourceFile: String
-                                  ) extends Event
+  timestamp: LocalDateTime
+) extends Event
 
 final case class SessionEndEvent(
-                                  timestamp: LocalDateTime,
-                                  sourceFile: String
-                                ) extends Event
+  timestamp: LocalDateTime
+) extends Event
 
 final case class QuickSearchEvent(
-                                   timestamp: LocalDateTime,
-                                   queryText: String,
-                                   searchId: String,
-                                   resultDocs: Seq[String],
-                                   sourceFile: String
-                                 ) extends Event
+  timestamp: LocalDateTime,
+  queryText: String,
+  searchId: String,
+  resultDocs: Set[String]
+) extends SearchEvent
 
 final case class CardSearchEvent(
-                                  timestamp: LocalDateTime,
-                                  rawCardLines: Seq[String],
-                                  searchId: String,
-                                  resultDocs: Seq[String],
-                                  sourceFile: String
-                                ) extends Event
+  timestamp: LocalDateTime,
+  parameters: Vector[SearchParameter],
+  rawCardLines: Vector[String],
+  searchId: String,
+  resultDocs: Set[String]
+) extends SearchEvent
 
 final case class DocOpenEvent(
-                               timestamp: LocalDateTime,
-                               searchId: String,
-                               docId: String,
-                               sourceFile: String
-                             ) extends Event
+  timestamp: LocalDateTime,
+  searchId: String,
+  docId: String
+) extends Event
 
 final case class BrokenEvent(
-                              rawLines: Seq[String],
-                              reason: String,
-                              sourceFile: String
-                            ) extends Event
+  reason: String,
+  rawLines: Vector[String]
+)
+
+final case class SessionLog(
+  sourceFile: String,
+  events: Vector[Event],
+  brokenEvents: Vector[BrokenEvent]
+)
+
+final case class DailyDocumentOpen(
+  day: LocalDate,
+  docId: String
+)
+
+final case class SessionMetrics(
+  task1Count: Long,
+  quickSearchDocOpens: Vector[(DailyDocumentOpen, Long)],
+  brokenEventCount: Long
+)
+
+final case class ComputationResult(
+  task1Count: Long,
+  task2Rows: Vector[(DailyDocumentOpen, Long)],
+  brokenEventCount: Long
+)

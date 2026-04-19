@@ -1,6 +1,6 @@
 package ru.test
 
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.{SparkConf, SparkContext}
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths, StandardOpenOption}
@@ -10,65 +10,60 @@ import scala.util.Using
 object Main {
 
   def main(args: Array[String]): Unit = {
-    val spark = SparkSession.builder()
-      .appName("ConsultantSparkTask")
-      .master("local[*]")
-      .getOrCreate()
-
-    spark.sparkContext.setLogLevel("ERROR")
-    import spark.implicits._
-
     val inputDir = Paths.get("data/sessions")
     val outputDir = Paths.get("results")
 
-    val files =
-      if (Files.exists(inputDir) && Files.isDirectory(inputDir)) {
-        Using.resource(Files.list(inputDir)) { stream =>
-          stream.iterator().asScala
-            .filter(Files.isRegularFile(_))
-            .toList
-        }
-      } else {
-        throw new IllegalArgumentException(s"Input directory not found: $inputDir")
-      }
+    val sparkConf = new SparkConf()
+      .setAppName("ConsultantSparkTask")
+      .setMaster("local[*]")
 
-    val allEvents = files.flatMap(EventParser.parseFile)
+    val sparkContext = new SparkContext(sparkConf)
+    sparkContext.setLogLevel("ERROR")
 
-    val quickSearches = allEvents.collect { case e: QuickSearchEvent => e }
-    val cardSearches  = allEvents.collect { case e: CardSearchEvent => e }
-    val docOpens      = allEvents.collect { case e: DocOpenEvent => e }
+    try {
+      val inputFiles = listInputFiles(inputDir)
+      val sessionLogs = sparkContext
+        .parallelize(inputFiles, math.min(inputFiles.size, sparkContext.defaultParallelism).max(1))
+        .map(path => EventParser.parseFile(Paths.get(path)))
 
-    val quickSearchesDf = quickSearches.toDF()
-    val cardSearchesDf  = cardSearches.toDF()
-    val docOpensDf      = docOpens.toDF()
+      val result = TaskSolver.solve(sessionLogs)
 
-    val task1Result = TaskSolver.solveTask1(cardSearchesDf)
-    val task2Df = TaskSolver.solveTask2(quickSearchesDf, docOpensDf)
+      saveResults(outputDir, result)
 
-    saveResults(outputDir, task1Result, task2Df)
-
-    println(s"Results successfully saved to: ${outputDir.toAbsolutePath}")
-
-    spark.stop()
+      println(s"Task 1 result: ${result.task1Count}")
+      println(s"Task 2 rows: ${result.task2Rows.size}")
+      println(s"Broken events skipped: ${result.brokenEventCount}")
+      println(s"Results saved to: ${outputDir.toAbsolutePath}")
+    } finally {
+      sparkContext.stop()
+    }
   }
 
-  private def saveResults(
-                           outputDir: Path,
-                           task1Result: Long,
-                           task2Df: org.apache.spark.sql.DataFrame
-                         ): Unit = {
+  private def listInputFiles(inputDir: Path): Vector[String] = {
+    if (!Files.exists(inputDir) || !Files.isDirectory(inputDir)) {
+      throw new IllegalArgumentException(s"Input directory not found: $inputDir")
+    }
 
+    Using.resource(Files.list(inputDir)) { stream =>
+      stream.iterator().asScala
+        .filter(Files.isRegularFile(_))
+        .map(_.toAbsolutePath.toString)
+        .toVector
+        .sorted
+    }
+  }
+
+  private def saveResults(outputDir: Path, result: ComputationResult): Unit = {
     if (!Files.exists(outputDir)) {
       Files.createDirectories(outputDir)
     }
 
-    saveTask1(outputDir.resolve("task1.txt"), task1Result)
-    saveTask2(outputDir.resolve("task2.csv"), task2Df)
+    saveTask1(outputDir.resolve("task1.txt"), result.task1Count)
+    saveTask2(outputDir.resolve("task2.csv"), result.task2Rows)
   }
 
-  private def saveTask1(path: Path, task1Result: Long): Unit = {
-    val content =
-      s"Количество раз, когда в карточке производили поиск документа ACC_45616: $task1Result"
+  private def saveTask1(path: Path, task1Count: Long): Unit = {
+    val content = s"Card searches with document ACC_45616: $task1Count"
 
     Files.writeString(
       path,
@@ -79,21 +74,13 @@ object Main {
     )
   }
 
-  private def saveTask2(path: Path, task2Df: org.apache.spark.sql.DataFrame): Unit = {
-    val rows = task2Df.collect()
-
-    val lines =
-      ("day,docId,open_count" +:
-        rows.map { row =>
-          val day = row.getAs[String]("day")
-          val docId = row.getAs[String]("docId")
-          val openCount = row.getAs[Long]("open_count")
-          s"$day,$docId,$openCount"
-        }).mkString(System.lineSeparator())
+  private def saveTask2(path: Path, task2Rows: Vector[(DailyDocumentOpen, Long)]): Unit = {
+    val header = "day,doc_id,open_count"
+    val lines = header +: TaskSolver.renderTask2Rows(task2Rows)
 
     Files.writeString(
       path,
-      lines,
+      lines.mkString(System.lineSeparator()),
       StandardCharsets.UTF_8,
       StandardOpenOption.CREATE,
       StandardOpenOption.TRUNCATE_EXISTING

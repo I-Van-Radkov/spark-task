@@ -3,7 +3,10 @@ package ru.test
 import java.nio.charset.{Charset, StandardCharsets}
 import java.nio.file.{Files, Path}
 import java.time.LocalDateTime
-import java.time.format.DateTimeFormatter
+import java.time.format.{DateTimeFormatter, DateTimeFormatterBuilder}
+import java.util.Locale
+
+import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
 import scala.util.Try
 
@@ -11,214 +14,227 @@ object EventParser {
 
   private val Cp1251: Charset = Charset.forName("windows-1251")
   private val Utf8: Charset = StandardCharsets.UTF_8
-  private val TsFormatter: DateTimeFormatter =
+
+  private val CompactTimestampFormatter: DateTimeFormatter =
     DateTimeFormatter.ofPattern("dd.MM.yyyy_HH:mm:ss")
+
+  private val VerboseTimestampFormatter: DateTimeFormatter =
+    new DateTimeFormatterBuilder()
+      .parseCaseInsensitive()
+      .appendPattern("EEE,_d_MMM_yyyy_HH:mm:ss_Z")
+      .toFormatter(Locale.ENGLISH)
+
+  private val SearchParameterPattern = "^\\$([^\\s]+)\\s*(.*)$".r
+
+  def parseFile(path: Path): SessionLog = {
+    val lines = readLines(path)
+    parseLines(lines, path.toAbsolutePath.toString)
+  }
 
   def readLines(path: Path): List[String] = {
     val cp1251Attempt = Try(Files.readAllLines(path, Cp1251).asScala.toList)
     cp1251Attempt.getOrElse(Files.readAllLines(path, Utf8).asScala.toList)
   }
 
-  def parseFile(path: Path): Seq[Event] = {
-    val sourceFile = path.toAbsolutePath.toString
-    val lines = readLines(path)
-    parseLines(lines, sourceFile)
-  }
+  def parseLines(lines: List[String], sourceFile: String): SessionLog = {
+    val events = ArrayBuffer.empty[Event]
+    val brokenEvents = ArrayBuffer.empty[BrokenEvent]
 
-  def parseLines(lines: List[String], sourceFile: String): Seq[Event] = {
-    val events = scala.collection.mutable.ArrayBuffer.empty[Event]
-    var i = 0
-
-    while (i < lines.length) {
-      val raw = lines(i)
-      val line = raw.trim
+    var index = 0
+    while (index < lines.length) {
+      val rawLine = lines(index)
+      val line = rawLine.trim
 
       if (line.isEmpty) {
-        i += 1
+        index += 1
       } else if (line.startsWith("SESSION_START ")) {
-        parseSessionStart(line, sourceFile) match {
+        parseSingleLineEvent(line, "SESSION_START")(SessionStartEvent.apply) match {
           case Some(event) => events += event
-          case None => events += BrokenEvent(Seq(raw), "Cannot parse SESSION_START", sourceFile)
+          case None => brokenEvents += BrokenEvent("Cannot parse SESSION_START", Vector(rawLine))
         }
-        i += 1
-
+        index += 1
       } else if (line.startsWith("SESSION_END ")) {
-        parseSessionEnd(line, sourceFile) match {
+        parseSingleLineEvent(line, "SESSION_END")(SessionEndEvent.apply) match {
           case Some(event) => events += event
-          case None => events += BrokenEvent(Seq(raw), "Cannot parse SESSION_END", sourceFile)
+          case None => brokenEvents += BrokenEvent("Cannot parse SESSION_END", Vector(rawLine))
         }
-        i += 1
-
+        index += 1
       } else if (line.startsWith("DOC_OPEN ")) {
-        parseDocOpen(line, sourceFile) match {
+        parseDocOpen(line) match {
           case Some(event) => events += event
-          case None => events += BrokenEvent(Seq(raw), "Cannot parse DOC_OPEN", sourceFile)
+          case None => brokenEvents += BrokenEvent("Cannot parse DOC_OPEN", Vector(rawLine))
         }
-        i += 1
-
+        index += 1
       } else if (line.startsWith("QS ")) {
-        val (eventOpt, nextIndex) = parseQuickSearch(lines, i, sourceFile)
+        val (eventOpt, nextIndex, rawBlock) = parseQuickSearch(lines, index)
         eventOpt match {
           case Some(event) => events += event
-          case None => events += BrokenEvent(Seq(raw), "Cannot parse QS block", sourceFile)
+          case None => brokenEvents += BrokenEvent("Cannot parse QS block", rawBlock)
         }
-        i = nextIndex
-
+        index = nextIndex
       } else if (line.startsWith("CARD_SEARCH_START ")) {
-        val (eventOpt, nextIndex) = parseCardSearch(lines, i, sourceFile)
+        val (eventOpt, nextIndex, rawBlock) = parseCardSearch(lines, index)
         eventOpt match {
           case Some(event) => events += event
-          case None => events += BrokenEvent(Seq(raw), "Cannot parse CARD_SEARCH block", sourceFile)
+          case None => brokenEvents += BrokenEvent("Cannot parse CARD_SEARCH block", rawBlock)
         }
-        i = nextIndex
-
+        index = nextIndex
       } else {
-        i += 1
+        brokenEvents += BrokenEvent("Unknown line prefix", Vector(rawLine))
+        index += 1
       }
     }
 
-    events.toSeq
-  }
-
-  private def parseTimestamp(raw: String): Option[LocalDateTime] =
-    Try(LocalDateTime.parse(raw, TsFormatter)).toOption
-
-  private def parseSessionStart(line: String, sourceFile: String): Option[SessionStartEvent] = {
-    val parts = line.split("\\s+")
-    if (parts.length >= 2) {
-      parseTimestamp(parts(1)).map(ts => SessionStartEvent(ts, sourceFile))
-    } else None
-  }
-
-  private def parseSessionEnd(line: String, sourceFile: String): Option[SessionEndEvent] = {
-    val parts = line.split("\\s+")
-    if (parts.length >= 2) {
-      parseTimestamp(parts(1)).map(ts => SessionEndEvent(ts, sourceFile))
-    } else None
-  }
-
-  private def parseDocOpen(line: String, sourceFile: String): Option[DocOpenEvent] = {
-    val parts = line.split("\\s+")
-    if (parts.length >= 4) {
-      for {
-        ts <- parseTimestamp(parts(1))
-      } yield DocOpenEvent(
-        timestamp = ts,
-        searchId = parts(2),
-        docId = parts(3),
-        sourceFile = sourceFile
-      )
-    } else None
-  }
-
-  private def parseQuickSearch(
-                                lines: List[String],
-                                startIndex: Int,
-                                sourceFile: String
-                              ): (Option[QuickSearchEvent], Int) = {
-    val firstLine = lines(startIndex).trim
-
-    val firstLineParts = firstLine.split("\\s+", 3)
-    if (firstLineParts.length < 3) {
-      return (None, startIndex + 1)
-    }
-
-    val timestampOpt = parseTimestamp(firstLineParts(1))
-    val queryText = firstLineParts(2)
-
-    val nextIndex = startIndex + 1
-    if (nextIndex >= lines.length) {
-      return (None, nextIndex)
-    }
-
-    val resultLine = lines(nextIndex).trim
-    val resultParts = resultLine.split("\\s+")
-
-    if (timestampOpt.isEmpty || resultParts.length < 2) {
-      return (None, nextIndex + 1)
-    }
-
-    val searchId = resultParts.head
-    val docs = resultParts.tail.toSeq
-
-    (
-      Some(
-        QuickSearchEvent(
-          timestamp = timestampOpt.get,
-          queryText = queryText,
-          searchId = searchId,
-          resultDocs = docs,
-          sourceFile = sourceFile
-        )
-      ),
-      nextIndex + 1
+    SessionLog(
+      sourceFile = sourceFile,
+      events = events.toVector,
+      brokenEvents = brokenEvents.toVector
     )
   }
 
+  private def parseSingleLineEvent(
+    line: String,
+    prefix: String
+  )(
+    buildEvent: LocalDateTime => Event
+  ): Option[Event] = {
+    val timestampRaw = line.stripPrefix(prefix).trim
+    parseTimestamp(timestampRaw).map(buildEvent)
+  }
+
+  private def parseDocOpen(line: String): Option[DocOpenEvent] = {
+    val parts = line.split("\\s+")
+    if (parts.length < 4) {
+      None
+    } else {
+      parseTimestamp(parts(1)).map { timestamp =>
+        DocOpenEvent(
+          timestamp = timestamp,
+          searchId = parts(2),
+          docId = normalizeDocumentId(parts(3))
+        )
+      }
+    }
+  }
+
+  private def parseQuickSearch(
+    lines: List[String],
+    startIndex: Int
+  ): (Option[QuickSearchEvent], Int, Vector[String]) = {
+    val firstLine = lines(startIndex).trim
+    val firstLineParts = firstLine.split("\\s+", 3)
+
+    if (firstLineParts.length < 2) {
+      return (None, startIndex + 1, Vector(lines(startIndex)))
+    }
+
+    val queryText =
+      if (firstLineParts.length >= 3) firstLineParts(2)
+      else ""
+
+    val nextIndex = startIndex + 1
+    if (nextIndex >= lines.length) {
+      return (None, nextIndex, Vector(lines(startIndex)))
+    }
+
+    val rawBlock = Vector(lines(startIndex), lines(nextIndex))
+
+    val eventOpt = for {
+      timestamp <- parseTimestamp(firstLineParts(1))
+      (searchId, resultDocs) <- parseSearchResultLine(lines(nextIndex))
+    } yield QuickSearchEvent(
+      timestamp = timestamp,
+      queryText = queryText,
+      searchId = searchId,
+      resultDocs = resultDocs
+    )
+
+    (eventOpt, nextIndex + 1, rawBlock)
+  }
+
   private def parseCardSearch(
-                               lines: List[String],
-                               startIndex: Int,
-                               sourceFile: String
-                             ): (Option[CardSearchEvent], Int) = {
+    lines: List[String],
+    startIndex: Int
+  ): (Option[CardSearchEvent], Int, Vector[String]) = {
     val startLine = lines(startIndex).trim
     val startParts = startLine.split("\\s+", 2)
 
     if (startParts.length < 2) {
-      return (None, startIndex + 1)
+      return (None, startIndex + 1, Vector(lines(startIndex)))
     }
 
     val timestampOpt = parseTimestamp(startParts(1))
     if (timestampOpt.isEmpty) {
-      return (None, startIndex + 1)
+      return (None, startIndex + 1, Vector(lines(startIndex)))
     }
 
-    var i = startIndex + 1
-    val rawCardLines = scala.collection.mutable.ArrayBuffer.empty[String]
+    val rawBlock = ArrayBuffer(lines(startIndex))
+    val rawCardLines = ArrayBuffer.empty[String]
+
+    var index = startIndex + 1
     var foundEnd = false
 
-    while (i < lines.length && !foundEnd) {
-      val line = lines(i).trim
+    while (index < lines.length && !foundEnd) {
+      rawBlock += lines(index)
+      val line = lines(index).trim
       if (line == "CARD_SEARCH_END") {
         foundEnd = true
       } else {
-        rawCardLines += lines(i)
+        rawCardLines += lines(index)
       }
-      i += 1
+      index += 1
     }
 
-    if (!foundEnd || i >= lines.length) {
-      return (None, i)
+    if (!foundEnd) {
+      return (None, index, rawBlock.toVector)
     }
 
-    while (i < lines.length && lines(i).trim.isEmpty) {
-      i += 1
+    while (index < lines.length && lines(index).trim.isEmpty) {
+      rawBlock += lines(index)
+      index += 1
     }
 
-    if (i >= lines.length) {
-      return (None, i)
+    if (index >= lines.length) {
+      return (None, index, rawBlock.toVector)
     }
 
-    val resultLine = lines(i).trim
-    val resultParts = resultLine.split("\\s+")
+    rawBlock += lines(index)
 
-    if (resultParts.length < 2) {
-      return (None, i + 1)
-    }
-
-    val searchId = resultParts.head
-    val docs = resultParts.tail.toSeq
-
-    (
-      Some(
-        CardSearchEvent(
-          timestamp = timestampOpt.get,
-          rawCardLines = rawCardLines.toSeq,
-          searchId = searchId,
-          resultDocs = docs,
-          sourceFile = sourceFile
-        )
-      ),
-      i + 1
+    val eventOpt = for {
+      (searchId, resultDocs) <- parseSearchResultLine(lines(index))
+    } yield CardSearchEvent(
+      timestamp = timestampOpt.get,
+      parameters = parseSearchParameters(rawCardLines.toVector),
+      rawCardLines = rawCardLines.toVector,
+      searchId = searchId,
+      resultDocs = resultDocs
     )
+
+    (eventOpt, index + 1, rawBlock.toVector)
   }
+
+  private def parseSearchResultLine(line: String): Option[(String, Set[String])] = {
+    val parts = line.trim.split("\\s+").filter(_.nonEmpty)
+    if (parts.isEmpty) {
+      None
+    } else {
+      val searchId = parts.head
+      val resultDocs = parts.tail.iterator.map(normalizeDocumentId).toSet
+      Some(searchId -> resultDocs)
+    }
+  }
+
+  private def parseSearchParameters(rawLines: Vector[String]): Vector[SearchParameter] =
+    rawLines.collect {
+      case SearchParameterPattern(parameterId, value) =>
+        SearchParameter(parameterId = parameterId, value = value.trim)
+    }
+
+  private def parseTimestamp(raw: String): Option[LocalDateTime] =
+    Try(LocalDateTime.parse(raw, CompactTimestampFormatter))
+      .orElse(Try(LocalDateTime.from(VerboseTimestampFormatter.parse(raw))))
+      .toOption
+
+  private def normalizeDocumentId(raw: String): String =
+    raw.trim.toUpperCase(Locale.ROOT)
 }
